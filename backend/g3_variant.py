@@ -16,6 +16,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 import requests
+import textwrap
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
@@ -25,7 +26,7 @@ import seaborn as sns
 def fetch_variant_data(uniprot_id):
     uniprot_id = uniprot_id.strip().upper()
     url = f'https://www.ebi.ac.uk/proteins/api/variation/{uniprot_id}?format=json'
-    # This is the API link i got from Uniprot
+    # This is the API link from Uniprot
     #print('Requesting', url)
     # Fetch the JSON
     r = requests.get(url, timeout=30)
@@ -383,7 +384,7 @@ def disease_associated_variants(uniprot_id):
         summary += f" • {disease}: {count} ({count/total_variants*100:.1f}%)\n"
 
     df_variants["begin"] = pd.to_numeric(df_variants["begin"], errors="coerce")
-    #protein_length = df_variants['begin'].max() + 10
+    protein_length = df_variants['begin'].max() + 10
     
     ### disease-associated variants table
     df_disease_table = df_variants.copy()
@@ -405,5 +406,193 @@ def disease_associated_variants(uniprot_id):
 
     df_disease_table = df_disease_table.sort_values('begin').reset_index(drop=True)
 
+    ### disease plotting
+    df_hotspot = df_variants[
+    (df_variants["DiseaseList"].notna()) &
+    (df_variants["begin"].notna())].copy()
+
+    bin_size = 20
+    bins = list(range(0, int(protein_length) + bin_size, bin_size))
+
+    df_hotspot["position_bin"] = pd.cut(
+        df_hotspot["begin"],
+        bins=bins,
+        include_lowest=True
+    )
+
+    hotspot_counts = (
+        df_hotspot
+        .groupby("position_bin")
+        .size()
+        .reset_index(name="DiseaseVariantCount")
+    )
+
+    hotspot_counts["bin_center"] = hotspot_counts["position_bin"].apply(
+        lambda x: int((x.left + x.right) / 2)
+    )
+
+    df_variants["IsDamaging"] = (
+        (df_variants["PolyPhen_prediction"] == "probably damaging") &
+        (df_variants["PolyPhen_score"] >= 0.85)
+    )
+
+    df_priority = df_variants[
+        (df_variants["IsDamaging"]) &
+        (df_variants["DiseaseList"].notna())
+    ].copy()
+
+    total = len(df_variants)
+    damaging = df_variants["IsDamaging"].sum()
+    disease = df_variants["DiseaseList"].notna().sum()
+    high_risk = len(df_priority)
+
+    top_variants = (
+        df_priority
+        .sort_values("PolyPhen_score", ascending=False)
+        .head(10)
+    )
+
+    top_variants[[
+        "begin",
+        "wild_type",
+        "alt_seq",
+        "PolyPhen_score",
+        "DiseaseList"
+    ]]
+
+    df_diseases = df_priority.copy()
+
+    disease_counts = (
+        df_diseases["DiseaseList"]
+        .str.split("; ")
+        .explode()
+        .value_counts()
+        .head(10)
+    )
+    
+
+    summary = pd.DataFrame({
+        "Group": ["All variants", "Disease-associated", "Damaging", "High-risk"],
+        "Count": [
+            len(df_variants),
+            disease,
+            damaging,
+            high_risk
+        ]
+    })
+
+    text2 = f"""
+    Disease Causing Variant Summary
+
+    • Total variants: {total}
+
+    • Predicted damaging variants:
+    └─ {damaging} ({damaging/total*100:.1f}%)
+
+    • Disease-associated variants:
+    └─ {disease} ({disease/total*100:.1f}%)
+
+    • High-confidence disease-damaging variants:
+    └─ {high_risk} ({high_risk/total*100:.1f}%)
+
+    Most frequent diseases linked to damaging variants:
+    {disease_counts}
+    """.strip()
+
+    
+    #--------Plotting---------
+    sns.set_style("whitegrid")
+
+    fig2 = plt.figure(figsize=(16, 10))
+
+    gs = fig2.add_gridspec(
+        2, 2,
+        height_ratios=[1.1, 1],
+        width_ratios=[0.7, 1.3],  # more space for C
+        hspace=0.5,
+        wspace=0.9
+    )
+
+    sns.set_style("whitegrid")
+
+    #fig = plt.figure(figsize=(16, 10))
+
+    # ------A. Disease variant distribution along sequence ----------------
+    ax1 = fig2.add_subplot(gs[0, :])
+
+    sns.barplot(
+        data=hotspot_counts,
+        x="bin_center",
+        y="DiseaseVariantCount",
+        color="#6baed6",
+        edgecolor="black",
+        ax=ax1
+    )
+
+    ax1.set_title("A. Distribution of Disease-Associated Variants Along Protein Sequence", fontsize=12)
+    ax1.set_xlabel("Protein Position (amino acid, bin centers)")
+    ax1.set_ylabel("Number of Disease-Associated Variants")
+    ax1.tick_params(axis='x', rotation=45)
+    ax1.grid(True, alpha=0.3)
+
+    # ---------------- B. Variant filtering summary  ----------------
+    ax2 = fig2.add_subplot(gs[1,0])
+
+    colors_b = sns.color_palette("PuBu", n_colors=len(summary))
+
+
+    wedges, texts, autotexts = ax2.pie(
+        summary["Count"],
+        labels=None,                      
+        autopct=lambda p: f"{p:.1f}%" if p > 4 else "",
+        startangle=90,
+        colors=colors_b,
+        pctdistance=0.7,
+        wedgeprops=dict(edgecolor="white")
+    )
+
+    ax2.legend(
+        wedges,
+        summary["Group"],
+        title="Variant category",
+        bbox_to_anchor=(1.05, 0.5), 
+        loc="upper center",
+        frameon=False,
+        fontsize=6,
+        title_fontsize=8
+    )
+    for autotext in autotexts:
+        autotext.set_fontsize(7)
+
+    ax2.set_title("B. Variant Filtering and Prioritization Summary",fontsize=11,pad=10)
+    ax2.axis("equal")
+    # ---------------- C. Disease frequency ----------------
+    ax3 = fig2.add_subplot(gs[1,1])
+
+    wrapped_labels = [
+        "\n".join(textwrap.wrap(d, 35))
+        for d in disease_counts.index
+    ]
+
+    sns.barplot(
+        x=disease_counts.values,
+        y=wrapped_labels,
+        palette=sns.color_palette("Blues_d", len(wrapped_labels)),
+        edgecolor="black",
+        ax=ax3
+    )
+
+    ax3.yaxis.set_label_coords(-0.18, 0.5)
+    ax3.tick_params(axis='y', labelsize=7)
+    ax3.tick_params(axis='x', labelsize=8)
+    ax3.set_title("C. Most Frequent Diseases Associated with\nDamaging Variants",fontsize=10)
+    ax3.set_xlabel("Number of High-Risk Variants")
+    #ax3.yaxis.set_label_coords(-0.12, 0.5)
+
+    plt.tight_layout()
+
     #print("\nDisease-associated Variants Table:")
-    return df_disease_table, summary
+    return df_disease_table, summary, text2, fig2
+
+
+#disease_associated_variants('Q9Y243')
